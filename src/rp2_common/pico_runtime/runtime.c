@@ -140,7 +140,10 @@ void runtime_init(void) {
     }
 
 #if !(PICO_NO_RAM_VECTOR_TABLE || PICO_NO_FLASH)
+#ifndef __PIC__
+    /* our vector table has already been copied and patched to ram_vector_table in the startup */
     __builtin_memcpy(ram_vector_table, (uint32_t *) scb_hw->vtor, sizeof(ram_vector_table));
+#endif
     scb_hw->vtor = (uintptr_t) ram_vector_table;
 #endif
 

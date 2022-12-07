@@ -208,6 +208,23 @@ _entry_point:
     msr msp, r1
     bx r2
 
+.macro addOffSet reg
+#if __PIC__
+    // if not, we might need to patch the flash (r1) address with our offset
+    ldr r5, =__flash_binary_start
+    ldr r6, =__flash_binary_end
+    //ldr r7, =__firmwareOffset
+    //ldr r7, [r7]
+    cmp \reg, r5
+    blo no_patch_data\@
+    cmp \reg, r6
+    bhs no_patch_data\@
+    // patch the address
+    adds \reg, \reg, r7
+no_patch_data\@:
+#endif
+.endm
+
 // Reset handler:
 // - initialises .data
 // - clears .bss
@@ -218,6 +235,14 @@ _entry_point:
 .type _reset_handler,%function
 .thumb_func
 _reset_handler:
+#ifdef __PIC__
+    // our bootloader passes the offset of our firmware in flash in r10
+    mov r7, r10
+    ldr r2, =__firmwareOffset
+    str r7, [r2]
+#endif
+
+
     // Only core 0 should run the C runtime startup code; core 1 is normally
     // sleeping in the bootrom at this point but check to be sure
     ldr r0, =(SIO_BASE + SIO_CPUID_OFFSET)
@@ -229,18 +254,49 @@ _reset_handler:
     // in-place by the SRAM load. Still need to clear .bss
 #if !PICO_NO_FLASH
     adr r4, data_cpy_table
-
+    // patch in our offset, does nothing in NON-PIC
+    // addOffSet r4
     // assume there is at least one entry
 1:
     ldmia r4!, {r1-r3}
+    // check if we are at the end of the table
     cmp r1, #0
     beq 2f
+    // r1 is the source address, r2 is the destination address, r3 is the end of the area to copy
+    // patch in our offset, does nothing in NON-PIC
+    addOffSet r1
     bl data_cpy
     b 1b
 2:
 #endif
 
+   //Patch any of the tables in ram that have pointers to flash functions
+#if __PIC__
+    PatchRamTables:
+    // Load the addresses from the table
+    adr r4, patch_flash_addr_table
+    // patch in our offset, does nothing in NON-PIC
+    // addOffSet r4
+3:
+    // load the start and end addresses into r1 and r2
+    ldmia r4!, {r1-r2}
+    // if r1 is 0, then we are finished
+    cmp r1, #0
+    // exit if r1 = 0
+    beq 4f
+    // otherwise, patch the flash addresses
+    bl patch_flash_setup
+    // and goto next entry for the flash table. 
+    b 3b
+4:
+    LoadGlobalOffsetTableRegister:
+    ldr r0, =__ram_global_offset_table_begin
+    mov r9, r0 // Stupid trick to put global offset table location to r9, for Cortex-M0
+
+#endif
+
     // Zero out the BSS
+    // XXX PIC: Patch with offsets
     ldr r1, =__bss_start__
     ldr r2, =__bss_end__
     movs r0, #0
@@ -254,14 +310,35 @@ bss_fill_test:
 platform_entry: // symbol for stack traces
     // Use 32-bit jumps, in case these symbols are moved out of branch range
     // (e.g. if main is in SRAM and crt0 in flash)
+    // XXX PIC: Patch with Offsets?
     ldr r1, =runtime_init
+    // patch in our offset, does nothing in NON-PIC
+    addOffSet r1
     blx r1
+
     ldr r1, =main
+    // patch in our offset, does nothing in NON-PIC
+    addOffSet r1
     blx r1
+
     ldr r1, =exit
+    // patch in our offset, does nothing in NON-PIC
+    addOffSet r1
     blx r1
     // exit should not return.  If it does, hang the core.
     // (fall thru into our hang _exit impl
+
+// ----------------------------------------------------------------------------
+// If core 1 somehow gets into crt0 due to a spectacular VTOR mishap, we need to
+// catch it and send back to the sleep-and-launch code in the bootrom. Shouldn't
+// happen (it should sleep in the ROM until given an entry point via the
+// cross-core FIFOs) but it's good to be defensive.
+
+hold_non_core0_in_bootrom:
+    ldr r0, = 'W' | ('V' << 8)
+    bl rom_func_lookup
+    bx r0
+
 .weak _exit
 .type _exit,%function
 .thumb_func
@@ -302,7 +379,71 @@ data_cpy_table:
 .word __scratch_y_start__
 .word __scratch_y_end__
 
+#if __PIC__
+/* copy our vector table to RAM here, as we need to patch it */
+.word __vectors
+.word ram_vector_table
+.word ram_vector_table + (48 * 4)
+
+.word __flash_global_offset_table_begin
+.word __ram_global_offset_table_begin
+.word __ram_global_offset_table_end
+#endif
+
 .word 0 // null terminator
+
+#if __PIC__
+patch_flash_loop:
+    //load r1 pointer into r0
+    ldr r0, [r1]
+    // if r0 is within flash range, then patch it
+    cmp r0, r5
+    blo patch_flash_store
+    cmp r0, r6
+    bhs patch_flash_store
+    // patch the address
+    adds r0, r0, r3
+patch_flash_store:
+    // store r0 back to r1 pointer
+    stm r1!, {r0}
+    b patch_check_loop
+patch_flash_setup:
+    // are we at the end of this entry (start = end as r1 is incremented on each store)
+    ldr r5, =__flash_binary_start
+    ldr r6, =__flash_binary_end
+    ldr r3, =__firmwareOffset
+    ldr r3, [r3]
+patch_check_loop:
+    cmp r1, r2
+    blo patch_flash_loop
+    bx lr
+#endif
+
+
+#if __PIC__
+.align 2
+patch_flash_addr_table:
+/* patch our vector tables */
+.word ram_vector_table
+.word ram_vector_table + (48 * 4)
+
+.word __mutex_array_start
+.word __mutex_array_end
+
+.word __preinit_array_start
+.word __preinit_array_end
+
+.word __init_array_start
+.word __init_array_end
+
+.word __fini_array_start
+.word __fini_array_end
+
+.word __ram_global_offset_table_begin
+.word __ram_global_offset_table_end
+
+.word 0 // null terminator
+#endif
 
 // ----------------------------------------------------------------------------
 // Provide safe defaults for _exit and runtime_init
@@ -314,16 +455,6 @@ data_cpy_table:
 runtime_init:
     bx lr
 
-// ----------------------------------------------------------------------------
-// If core 1 somehow gets into crt0 due to a spectacular VTOR mishap, we need to
-// catch it and send back to the sleep-and-launch code in the bootrom. Shouldn't
-// happen (it should sleep in the ROM until given an entry point via the
-// cross-core FIFOs) but it's good to be defensive.
-
-hold_non_core0_in_bootrom:
-    ldr r0, = 'W' | ('V' << 8)
-    bl rom_func_lookup
-    bx r0
 
 .global __get_current_exception
 .thumb_func
